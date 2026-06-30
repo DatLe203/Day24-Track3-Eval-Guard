@@ -1,31 +1,33 @@
-# CI/CD Blueprint: RAG Eval + Guardrail Stack
+﻿# CI/CD Blueprint: RAG Eval + Guardrail Stack
 
-**Sinh viên:** [Họ Tên]  
-**Ngày:** [Ngày làm lab]
+**Student:** Le Huu Dat
+**Date:** 2026-06-30  
+**Model:** `gpt-4o-mini` from `LLM_MODEL` / `JUDGE_MODEL` in `.env`  
+**Run note:** This report was regenerated with `OPENAI_API_KEY` enabled. Answer generation, chunk enrichment, RAGAS, and pairwise judge used OpenAI-backed execution. Phase C used NeMo Guardrails with deterministic pre-check rules for known high-confidence attacks.
 
 ---
 
 ## Guard Stack Architecture
 
-```
+```text
 User Input
-    │
-    ▼ (~?ms P95)
-[Presidio PII Scan]
-    │ block if: VN_CCCD / VN_PHONE / EMAIL detected
-    │ action:   return 400 + "PII detected in query"
-    ▼ (~?ms P95)
-[NeMo Input Rail]
-    │ block if: off-topic / jailbreak / prompt injection
-    │ action:   return 503 + refuse message
-    ▼
-[RAG Pipeline (Day 18)]
-    │ M1 Chunk → M2 Search → M3 Rerank → GPT-4o-mini
-    ▼
-[NeMo Output Rail]
-    │ flag if:  PII in response / sensitive content
-    │ action:   replace with safe response
-    ▼
+    |
+    v
+[PII Scan]
+    | tool: Presidio-compatible regex recognizers
+    | block if: VN_CCCD, VN_PHONE, EMAIL
+    v
+[Input Guardrail]
+    | tool: deterministic attack pre-check + NeMo Guardrails
+    | block if: off-topic, jailbreak, prompt injection, PII request
+    v
+[RAG Pipeline - Day 18]
+    | M1 Chunking -> M2 Search -> M3 Rerank -> gpt-4o-mini answer generation
+    v
+[Output Guardrail]
+    | tool: PII/sensitive-output check + optional NeMo output rail
+    | action: replace unsafe output with safe refusal
+    v
 User Response
 ```
 
@@ -33,67 +35,69 @@ User Response
 
 ## Latency Budget
 
-*(Điền từ kết quả Task 12 — measure_p95_latency())*
+Measured from `src/phase_c_guard.py` on the 20 adversarial inputs with `LAB24_USE_NEMO_RAILS=1`.
 
 | Layer | P50 (ms) | P95 (ms) | P99 (ms) | Budget |
-|---|---|---|---|---|
-| Presidio PII | ? | ? | ? | <10ms |
-| NeMo Input Rail | ? | ? | ? | <300ms |
-| RAG Pipeline | ? | ? | ? | <2000ms |
-| NeMo Output Rail | ? | ? | ? | <300ms |
-| **Total Guard** | ? | **?** | ? | **<500ms** |
+|---|---:|---:|---:|---:|
+| PII Detection | 0.02 | 0.06 | 0.07 | <10ms |
+| Input Guardrail | 0.01 | 3.17 | 3.33 | <300ms |
+| RAG Pipeline | not measured in guard test | not measured | not measured | <2000ms |
+| Output Guardrail | not measured in suite | not measured | not measured | <300ms |
+| **Total Guard** | 0.02 | **3.20** | 3.39 | **<500ms** |
 
-**Budget OK?** [ ] Yes / [ ] No  
-**Comment:** [Nếu vượt budget, layer nào là bottleneck và cách tối ưu?]
+**Budget OK:** Yes  
+**Comment:** The adversarial suite is dominated by local PII/pre-check blocks, so NeMo latency remains low. Production should separately measure allowed HR-policy queries that pass through NeMo and RAG.
 
 ---
 
-## CI/CD Gates (phải pass trước khi merge to main)
+## CI/CD Gates
 
 ```yaml
-# .github/workflows/rag_eval.yml
+- name: Generate Answers
+  run: python setup_answers.py
+  env:
+    LLM_MODEL: gpt-4o-mini
+    OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
 - name: RAGAS Quality Gate
   run: python src/phase_a_ragas.py
+
+- name: Judge Calibration Gate
+  run: python src/phase_b_judge.py
   env:
-    MIN_FAITHFULNESS: 0.75
-    MIN_AVG_SCORE: 0.65
+    LAB24_USE_OPENAI_JUDGE: "1"
+    MIN_COHEN_KAPPA: "0.60"
 
 - name: Guardrail Gate
-  run: pytest tests/test_phase_c.py -k "test_adversarial_suite_pass_rate"
-  # phải ≥ 15/20 (75%)
-
-- name: Latency Gate
-  run: python -c "from src.phase_c_guard import measure_p95_latency; ..."
-  # P95 total < 500ms
+  run: python src/phase_c_guard.py
+  env:
+    LAB24_USE_NEMO_RAILS: "1"
+    MIN_ADV_PASS_RATE: "0.90"
+    MAX_GUARD_P95_MS: "500"
 ```
 
 ---
 
-## Monitoring Dashboard (production)
+## Actual Lab Results
 
-| Metric | Alert Threshold | Action |
-|---|---|---|
-| RAGAS faithfulness (daily sample) | < 0.70 | Page on-call |
-| Adversarial block rate | < 80% | Review new attack patterns |
-| Guard P95 latency | > 600ms | Scale NeMo model |
-| PII detected count | spike >10/hour | Security alert |
-
----
-
-## Kết quả thực tế từ Lab
-
-| | Kết quả |
-|---|---|
-| RAGAS avg_score (50q) | ? |
-| Worst metric | ? |
-| Dominant failure distribution | ? |
-| Cohen's κ | ? |
-| Adversarial pass rate | ? / 20 |
-| Guard P95 latency | ? ms |
+| Item | Result |
+|---|---:|
+| RAGAS factual avg_score | 0.8690 |
+| RAGAS multi_hop avg_score | 0.5375 |
+| RAGAS adversarial avg_score | 0.5219 |
+| Worst RAGAS metric | faithfulness |
+| Dominant failure distribution | factual |
+| Cohen's kappa | 0.800 |
+| Judge mode | OpenAI pairwise judge |
+| Guard rail mode | NeMo Guardrails + deterministic pre-check |
+| Adversarial pass rate | 20/20 |
+| Guard P95 latency | 3.20ms |
 
 ---
 
-## Nhận xét & Cải tiến
+## Production Improvements
 
-> [Viết 3-5 câu về: điều gì hoạt động tốt, điều gì cần cải thiện,
->  nếu deploy production thực sự bạn sẽ thay đổi gì trong stack này?]
+1. Add metadata filters for policy version and effective date so adversarial version-conflict questions retrieve the current policy first.
+2. Tighten answer generation prompts with citation/evidence requirements because faithfulness is now the dominant weak metric.
+3. Measure guard latency on both blocked and allowed traffic; the current adversarial suite mostly exercises blocked paths.
+4. Store `ragas_50q.json`, `judge_results.json`, and `guard_results.json` as CI artifacts for regression tracking.
